@@ -1,59 +1,62 @@
 # %pip install langchain langchain-community langchain-openai
 # !pip install underthesea
-
-import fitz  # PyMuPDF
-import pytesseract
-from PIL import Image, ImageEnhance, ImageFilter
 import io
 from datetime import datetime
-import numpy as np
-from sentence_transformers import SentenceTransformer
 import pickle
 import os
 import re
-from underthesea import sent_tokenize
-from transformers import AutoTokenizer
-import faiss
-import torch
+import argparse
+from typing import Optional
 
-# Kiểm tra GPU
-print(f"Số lượng GPU: {torch.cuda.device_count()}")
-for i in range(torch.cuda.device_count()):
-    print(f"GPU {i}: {torch.cuda.get_device_name(i)}")
-    print(f"  Tổng VRAM: {torch.cuda.get_device_properties(i).total_memory / 1024 / 1024**2:.2f} GB")
+# Model/tokenizer sẽ được load lười khi cần
+model = None  # type: ignore[var-annotated]
+tokenizer = None  # type: ignore[var-annotated]
 
-device = torch.device("cuda:0")
-print(f"\nĐang sử dụng: {torch.cuda.get_device_name(device)}")
+def ensure_model_and_tokenizer_loaded():
+    global model, tokenizer
+    if model is None or tokenizer is None:
+        from sentence_transformers import SentenceTransformer
+        from transformers import AutoTokenizer
+        model_path = os.environ.get("EMBED_MODEL_PATH", "intfloat/multilingual-e5-large")
+        model = SentenceTransformer(model_path)
+        tokenizer = AutoTokenizer.from_pretrained(model_path)
 
-# Load model embedding
-model_path = "D:/Vian/Step2_Embeding_and_VectorDB/models/multilingual_e5_large"
-model = SentenceTransformer(model_path)
-tokenizer = AutoTokenizer.from_pretrained(model_path)
-
-# Đường dẫn input folder chứa các PDF (mới thêm để xử lý hàng loạt)
-input_folder = "D:/Vian/Data/documents"  # Thay bằng folder chứa nhiều PDF cybersecurity
-output_dir = "./results"
+# Đường dẫn input folder chứa tài liệu (xử lý đệ quy tất cả thư mục con)
+input_folder = os.environ.get("DOCUMENTS_DIR", "/workspace/documents")
+output_dir = os.environ.get("EMBED_RESULTS_DIR", "./results")
 os.makedirs(output_dir, exist_ok=True)  # Tạo thư mục output nếu chưa có
+
+# Phần mở rộng tài liệu được hỗ trợ
+SUPPORTED_EXTS = {".pdf", ".txt", ".docx"}
 
 all_faiss_path = os.path.join(output_dir, "all_faiss.index")
 all_pickle_path = os.path.join(output_dir, "all_embeddings.pkl")
 
-def is_pdf_embedded(path):
+def is_document_embedded(path):
     """
-    Kiểm tra xem file PDF đã được embedding hay chưa dựa trên file pickle chung.
+    Kiểm tra xem tài liệu đã được embedding hay chưa dựa trên file pickle chung.
+    Vẫn tương thích với dữ liệu cũ sử dụng key 'pdf_name'.
     """
     if not os.path.exists(all_pickle_path):
         return False
-    pdf_name = os.path.splitext(os.path.basename(path))[0]
+    base_name = os.path.splitext(os.path.basename(path))[0]
     with open(all_pickle_path, 'rb') as f:
         all_data = pickle.load(f)
-    existing_pdf_names = {entry['pdf_name'] for entry in all_data}
-    return pdf_name in existing_pdf_names
+    existing_names = set()
+    for entry in all_data:
+        if isinstance(entry, dict):
+            if 'pdf_name' in entry:
+                existing_names.add(entry['pdf_name'])
+            if 'doc_name' in entry:  # phòng trường hợp về sau đổi key
+                existing_names.add(entry['doc_name'])
+    return base_name in existing_names
 
 def preprocess_image(img):
     """
     Tiền xử lý ảnh để cải thiện OCR.
     """
+    # Import lười để hỗ trợ --dry-run không cần pillow
+    from PIL import ImageEnhance, ImageFilter
     if img.mode != 'L':
         img = img.convert('L')
     enhancer = ImageEnhance.Contrast(img)
@@ -67,6 +70,11 @@ def ocr_pdf_to_text(pdf_path, output_dir):
     """
     try:
         print(f"📖 Đang OCR file: {pdf_path}")
+        # Import lười để hỗ trợ --dry-run
+        import fitz  # PyMuPDF
+        import pytesseract
+        from PIL import Image
+
         doc = fitz.open(pdf_path)
         total_pages = len(doc)
         full_text = ""
@@ -93,6 +101,33 @@ def ocr_pdf_to_text(pdf_path, output_dir):
         return full_text
     except Exception as e:
         print(f"❌ Lỗi OCR cho file {pdf_path}: {e}")
+        return None
+
+def read_txt_to_text(txt_path):
+    """
+    Đọc nội dung từ file .txt (thử nhiều encoding phổ biến).
+    """
+    try:
+        with open(txt_path, 'r', encoding='utf-8') as f:
+            return f.read()
+    except UnicodeDecodeError:
+        with open(txt_path, 'r', encoding='latin-1') as f:
+            return f.read()
+    except Exception as e:
+        print(f"❌ Lỗi đọc TXT {txt_path}: {e}")
+        return None
+
+def read_docx_to_text(docx_path):
+    """
+    Trích xuất text từ file .docx.
+    """
+    try:
+        # Import lười để hỗ trợ --dry-run
+        import docx2txt
+        text = docx2txt.process(docx_path) or ""
+        return text
+    except Exception as e:
+        print(f"❌ Lỗi đọc DOCX {docx_path}: {e}")
         return None
 
 def clean_text(text, pdf_path, output_dir):
@@ -127,6 +162,9 @@ def split_text_to_chunks_vi_tokenized_with_section(text, chunk_size=512, overlap
     """
     Chia text thành chunks dựa trên token, giữ cấu trúc section.
     """
+    # Import lười để hỗ trợ --dry-run
+    from underthesea import sent_tokenize
+    ensure_model_and_tokenizer_loaded()
     sections = split_sections(text)
     all_chunks = []
     for section in sections:
@@ -161,6 +199,7 @@ def create_embeddings(chunks):
     """
     try:
         print(f"🔄 Tạo embeddings cho {len(chunks)} chunks...")
+        ensure_model_and_tokenizer_loaded()
         embeddings = model.encode(chunks, show_progress_bar=True)
         print(f"✅ Hoàn thành tạo embeddings")
         return embeddings
@@ -177,7 +216,7 @@ def save_embeddings(chunks, embeddings, pdf_path, output_dir):
     os.makedirs(pdf_folder, exist_ok=True)
 
     data = {
-        'pdf_name': pdf_name,
+        'pdf_name': pdf_name,  # giữ key cũ để tương thích
         'chunks': chunks,
         'embeddings': embeddings,
         'created_at': datetime.now().isoformat()
@@ -202,6 +241,7 @@ def save_embeddings(chunks, embeddings, pdf_path, output_dir):
             f.write("-" * 30 + "\n\n")
 
     # Lưu info embeddings riêng
+    import numpy as np
     embedding_info_path = os.path.join(pdf_folder, f"{pdf_name}_embedding_info.txt")
     with open(embedding_info_path, 'w', encoding='utf-8') as f:
         f.write(f"THÔNG TIN EMBEDDINGS: {pdf_name}.pdf\n")
@@ -222,6 +262,7 @@ def save_embeddings(chunks, embeddings, pdf_path, output_dir):
             f.write("-" * 30 + "\n")
 
     # Lưu FAISS index riêng
+    import faiss
     index_path = os.path.join(pdf_folder, f"{pdf_name}_faiss.index")
     dim = embeddings.shape[1]
     index = faiss.IndexFlatL2(dim)
@@ -229,6 +270,7 @@ def save_embeddings(chunks, embeddings, pdf_path, output_dir):
     faiss.write_index(index, index_path)
 
     # Cập nhật FAISS chung
+    import faiss
     if os.path.exists(all_faiss_path):
         index_all = faiss.read_index(all_faiss_path)
     else:
@@ -255,29 +297,72 @@ def save_embeddings(chunks, embeddings, pdf_path, output_dir):
 
     return pickle_path, index_path
 
-# Quy trình chính: Embedding tất cả PDF trong input_folder (chức năng mới)
-pdf_files = [f for f in os.listdir(input_folder) if f.lower().endswith('.pdf')]
-print(f"🔍 Tìm thấy {len(pdf_files)} file PDF trong folder: {input_folder}")
+def discover_documents(root_dir, exts):
+    """
+    Duyệt đệ quy để lấy tất cả tài liệu hợp lệ trong thư mục.
+    """
+    for current_root, _, files in os.walk(root_dir):
+        for file_name in files:
+            ext = os.path.splitext(file_name)[1].lower()
+            if ext in exts:
+                yield os.path.join(current_root, file_name)
 
-for pdf_file in pdf_files:
-    pdf_path = os.path.join(input_folder, pdf_file)
-    if is_pdf_embedded(pdf_path):
-        print(f"📌 File {pdf_file} đã được embedding trước đó, bỏ qua.")
-        continue
-    
-    raw_text = ocr_pdf_to_text(pdf_path, output_dir)
-    if raw_text:
-        print(f"🧹 Làm sạch text cho {pdf_file}...")
-        cleaned_text = clean_text(raw_text, pdf_path, output_dir)
-        print(f"✂️ Chia text thành chunks cho {pdf_file}...")
-        chunks = split_text_to_chunks_vi_tokenized_with_section(cleaned_text)
-        print(f"📝 Đã tạo {len(chunks)} chunks cho {pdf_file}")
-        embeddings = create_embeddings(chunks)
-        if embeddings is not None:
-            pickle_path, faiss_path = save_embeddings(chunks, embeddings, pdf_path, output_dir)
-            print(f"\n🎉 HOÀN THÀNH embedding cho {pdf_file}!")
-            print(f"📊 Thống kê: - Số chunks: {len(chunks)} - Kích thước embedding: {embeddings.shape}")
-            print(f"✅ Đường dẫn embeddings: {pickle_path}")
-            print(f"✅ Đường dẫn FAISS index: {faiss_path}")
 
-print("\n✅ Đã xử lý tất cả PDF trong folder. Knowledge base đã cập nhật!")
+def extract_text_any(file_path, output_dir):
+    """
+    Trích xuất text từ tài liệu theo phần mở rộng.
+    PDF: sử dụng OCR hiện tại.
+    TXT/DOCX: đọc trực tiếp nội dung.
+    """
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext == ".pdf":
+        return ocr_pdf_to_text(file_path, output_dir)
+    if ext == ".txt":
+        return read_txt_to_text(file_path)
+    if ext == ".docx":
+        return read_docx_to_text(file_path)
+    return None
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Embed documents recursively")
+    parser.add_argument("--dry-run", action="store_true", help="Chỉ liệt kê tài liệu, không xử lý")
+    args = parser.parse_args()
+
+    # Quy trình chính: Embedding tất cả tài liệu trong input_folder và các thư mục con
+    all_docs = list(discover_documents(input_folder, SUPPORTED_EXTS))
+    print(f"🔍 Tìm thấy {len(all_docs)} tài liệu trong thư mục: {input_folder}")
+
+    if args.dry_run:
+        for path in all_docs[:50]:  # giới hạn in để gọn log
+            print(f" - {path}")
+        if len(all_docs) > 50:
+            print(f" ... và {len(all_docs) - 50} tài liệu khác")
+        return
+
+    for doc_path in all_docs:
+        doc_name = os.path.basename(doc_path)
+        if is_document_embedded(doc_path):
+            print(f"📌 File {doc_name} đã được embedding trước đó, bỏ qua.")
+            continue
+
+        raw_text = extract_text_any(doc_path, output_dir)
+        if raw_text:
+            print(f"🧹 Làm sạch text cho {doc_name}...")
+            cleaned_text = clean_text(raw_text, doc_path, output_dir)
+            print(f"✂️ Chia text thành chunks cho {doc_name}...")
+            chunks = split_text_to_chunks_vi_tokenized_with_section(cleaned_text)
+            print(f"📝 Đã tạo {len(chunks)} chunks cho {doc_name}")
+            embeddings = create_embeddings(chunks)
+            if embeddings is not None:
+                pickle_path, faiss_path = save_embeddings(chunks, embeddings, doc_path, output_dir)
+                print(f"\n🎉 HOÀN THÀNH embedding cho {doc_name}!")
+                print(f"📊 Thống kê: - Số chunks: {len(chunks)} - Kích thước embedding: {embeddings.shape}")
+                print(f"✅ Đường dẫn embeddings: {pickle_path}")
+                print(f"✅ Đường dẫn FAISS index: {faiss_path}")
+
+    print("\n✅ Đã xử lý tất cả tài liệu trong thư mục. Knowledge base đã cập nhật!")
+
+
+if __name__ == "__main__":
+    main()
