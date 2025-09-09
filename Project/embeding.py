@@ -17,22 +17,23 @@ import faiss
 import torch
 
 # Kiểm tra GPU
-print(f"Số lượng GPU: {torch.cuda.device_count()}")
-for i in range(torch.cuda.device_count()):
+num_gpus = torch.cuda.device_count()
+print(f"Số lượng GPU: {num_gpus}")
+for i in range(num_gpus):
     print(f"GPU {i}: {torch.cuda.get_device_name(i)}")
     print(f"  Tổng VRAM: {torch.cuda.get_device_properties(i).total_memory / 1024 / 1024**2:.2f} GB")
 
-device = torch.device("cuda:0")
-print(f"\nĐang sử dụng: {torch.cuda.get_device_name(device)}")
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"\nĐang sử dụng: {device.type.upper()}{f' - {torch.cuda.get_device_name(0)}' if device.type == 'cuda' else ''}")
 
 # Load model embedding
-model_path = "D:/Vian/Step2_Embeding_and_VectorDB/models/multilingual_e5_large"
-model = SentenceTransformer(model_path)
+model_path = os.environ.get("EMBED_MODEL", "intfloat/multilingual-e5-large")
+model = SentenceTransformer(model_path, device=str(device))
 tokenizer = AutoTokenizer.from_pretrained(model_path)
 
 # Đường dẫn input folder chứa các PDF (mới thêm để xử lý hàng loạt)
-input_folder = "D:/Vian/Data/documents"  # Thay bằng folder chứa nhiều PDF cybersecurity
-output_dir = "./results"
+input_folder = os.environ.get("DOCUMENTS_DIR", "/workspace/documents")
+output_dir = os.environ.get("EMBED_RESULTS_DIR", "./results")
 os.makedirs(output_dir, exist_ok=True)  # Tạo thư mục output nếu chưa có
 
 all_faiss_path = os.path.join(output_dir, "all_faiss.index")
@@ -47,8 +48,19 @@ def is_pdf_embedded(path):
     pdf_name = os.path.splitext(os.path.basename(path))[0]
     with open(all_pickle_path, 'rb') as f:
         all_data = pickle.load(f)
-    existing_pdf_names = {entry['pdf_name'] for entry in all_data}
-    return pdf_name in existing_pdf_names
+    # Ưu tiên so khớp theo đường dẫn tương đối để tránh trùng tên file ở khác thư mục
+    try:
+        pdf_rel_path = os.path.relpath(path, input_folder)
+    except Exception:
+        pdf_rel_path = os.path.basename(path)
+    existing_keys = set()
+    for entry in all_data:
+        if isinstance(entry, dict):
+            if 'pdf_rel_path' in entry:
+                existing_keys.add(entry['pdf_rel_path'])
+            elif 'pdf_name' in entry:
+                existing_keys.add(entry['pdf_name'])
+    return (pdf_rel_path in existing_keys) or (pdf_name in existing_keys)
 
 def preprocess_image(img):
     """
@@ -84,7 +96,8 @@ def ocr_pdf_to_text(pdf_path, output_dir):
         doc.close()
         print(f"✅ Hoàn thành OCR {total_pages} trang")
         pdf_name = os.path.splitext(os.path.basename(pdf_path))[0]
-        pdf_folder = os.path.join(output_dir, pdf_name)
+        pdf_rel_no_ext = os.path.splitext(os.path.relpath(pdf_path, input_folder))[0]
+        pdf_folder = os.path.join(output_dir, pdf_rel_no_ext)
         os.makedirs(pdf_folder, exist_ok=True)
         output_path = os.path.join(pdf_folder, f"{pdf_name}_ocr.txt")
         with open(output_path, "w", encoding="utf-8") as f:
@@ -108,7 +121,8 @@ def clean_text(text, pdf_path, output_dir):
     text = re.sub(r' *\n *', '\n', text)
     cleaned_text = text.strip()
     pdf_name = os.path.splitext(os.path.basename(pdf_path))[0]
-    pdf_folder = os.path.join(output_dir, pdf_name)
+    pdf_rel_no_ext = os.path.splitext(os.path.relpath(pdf_path, input_folder))[0]
+    pdf_folder = os.path.join(output_dir, pdf_rel_no_ext)
     os.makedirs(pdf_folder, exist_ok=True)
     output_path = os.path.join(pdf_folder, f"{pdf_name}_clean.txt")
     with open(output_path, "w", encoding="utf-8") as f:
@@ -173,11 +187,13 @@ def save_embeddings(chunks, embeddings, pdf_path, output_dir):
     Lưu embeddings vào folder riêng và cập nhật file chung.
     """
     pdf_name = os.path.splitext(os.path.basename(pdf_path))[0]
-    pdf_folder = os.path.join(output_dir, pdf_name)
+    pdf_rel_no_ext = os.path.splitext(os.path.relpath(pdf_path, input_folder))[0]
+    pdf_folder = os.path.join(output_dir, pdf_rel_no_ext)
     os.makedirs(pdf_folder, exist_ok=True)
 
     data = {
         'pdf_name': pdf_name,
+        'pdf_rel_path': os.path.relpath(pdf_path, input_folder),
         'chunks': chunks,
         'embeddings': embeddings,
         'created_at': datetime.now().isoformat()
@@ -255,27 +271,30 @@ def save_embeddings(chunks, embeddings, pdf_path, output_dir):
 
     return pickle_path, index_path
 
-# Quy trình chính: Embedding tất cả PDF trong input_folder (chức năng mới)
-pdf_files = [f for f in os.listdir(input_folder) if f.lower().endswith('.pdf')]
-print(f"🔍 Tìm thấy {len(pdf_files)} file PDF trong folder: {input_folder}")
+# Quy trình chính: Embedding tất cả PDF trong input_folder và các thư mục con (đệ quy)
+pdf_files = []
+for root, _, files in os.walk(input_folder):
+    for f in files:
+        if f.lower().endswith('.pdf'):
+            pdf_files.append(os.path.join(root, f))
+print(f"🔍 Tìm thấy {len(pdf_files)} file PDF trong thư mục (đệ quy): {input_folder}")
 
-for pdf_file in pdf_files:
-    pdf_path = os.path.join(input_folder, pdf_file)
+for pdf_path in pdf_files:
     if is_pdf_embedded(pdf_path):
-        print(f"📌 File {pdf_file} đã được embedding trước đó, bỏ qua.")
+        print(f"📌 File {pdf_path} đã được embedding trước đó, bỏ qua.")
         continue
     
     raw_text = ocr_pdf_to_text(pdf_path, output_dir)
     if raw_text:
-        print(f"🧹 Làm sạch text cho {pdf_file}...")
+        print(f"🧹 Làm sạch text cho {pdf_path}...")
         cleaned_text = clean_text(raw_text, pdf_path, output_dir)
-        print(f"✂️ Chia text thành chunks cho {pdf_file}...")
+        print(f"✂️ Chia text thành chunks cho {pdf_path}...")
         chunks = split_text_to_chunks_vi_tokenized_with_section(cleaned_text)
-        print(f"📝 Đã tạo {len(chunks)} chunks cho {pdf_file}")
+        print(f"📝 Đã tạo {len(chunks)} chunks cho {os.path.basename(pdf_path)}")
         embeddings = create_embeddings(chunks)
         if embeddings is not None:
             pickle_path, faiss_path = save_embeddings(chunks, embeddings, pdf_path, output_dir)
-            print(f"\n🎉 HOÀN THÀNH embedding cho {pdf_file}!")
+            print(f"\n🎉 HOÀN THÀNH embedding cho {pdf_path}!")
             print(f"📊 Thống kê: - Số chunks: {len(chunks)} - Kích thước embedding: {embeddings.shape}")
             print(f"✅ Đường dẫn embeddings: {pickle_path}")
             print(f"✅ Đường dẫn FAISS index: {faiss_path}")
